@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"fmt"
-	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"libp2p-chat/controllers"
 	"libp2p-chat/internal"
 	"libp2p-chat/misk"
@@ -14,6 +12,9 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/jessevdk/go-flags"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 
@@ -24,25 +25,33 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+
 	// "github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 )
 
+var MyHost host.Host
+var Ctx = context.Background()
+var options Options
+var parser = flags.NewParser(&options, flags.Default)
+
+type Options struct {
+	Instance string `short:"i" long:"instance" description:"Instance name" default:"chat"`
+}
+
+type discoveryNotification struct {
+	h host.Host
+}
+
 func main() {
 	run()
 }
 
-// discoveryNotifee gets notified when we find a new peer via mDNS discovery
-type discoveryNotifee struct {
-	h host.Host
-}
-
-func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	fmt.Printf("discovered new peer %s\n", pi.ID.Pretty())
-	err := n.h.Connect(context.Background(), pi)
+func (n *discoveryNotification) HandlePeerFound(pi peer.AddrInfo) {
+	err := n.h.Connect(Ctx, pi)
 	if err != nil {
-		fmt.Printf("error connecting to peer %s: %s\n", pi.ID.Pretty(), err)
+		log.Printf("error connecting to peer %s: %s\n", pi.ID, err)
 	}
 	_, err = internal.SavePeer(pi)
 	if err != nil {
@@ -50,10 +59,39 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	}
 }
 
-func run() {
-	internal.DatabaseConnect()
+func ProcessDhtMessage(sub *pubsub.Subscription) {
+	dhtMes, err := sub.Next(context.Background())
+	if err != nil {
+		log.Println(err)
+		return
+	}
 
+	mes := internal.Message{}
+	err = json.Unmarshal(dhtMes.Data, &mes)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	internal.ProcessMessage(mes, MyHost.Peerstore().PrivKey(MyHost.ID()))
+}
+
+func run() {
 	log.SetFlags(log.Lshortfile)
+
+	if _, err := parser.Parse(); err != nil {
+		switch flagsErr := err.(type) {
+		case flags.ErrorType:
+			if flagsErr == flags.ErrHelp {
+				os.Exit(0)
+			}
+			os.Exit(1)
+		default:
+			os.Exit(1)
+		}
+	}
+
+	internal.DatabaseConnect()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -76,7 +114,7 @@ func run() {
 	if err != nil {
 		panic(err)
 	}
-	h2, err := libp2p.New(
+	MyHost, err = libp2p.New(
 
 		libp2p.ListenAddrStrings(
 			"/ip4/0.0.0.0/tcp/0",
@@ -104,17 +142,17 @@ func run() {
 	if err != nil {
 		panic(err)
 	}
-	defer h2.Close()
+	defer MyHost.Close()
 
-	s := mdns.NewMdnsService(h2, misk.ServiceName, &discoveryNotifee{h: h2})
+	s := mdns.NewMdnsService(MyHost, misk.ServiceName, &discoveryNotification{h: MyHost})
 	s.Start()
 
 	//for _, addr := range dht.DefaultBootstrapPeers {
 	//	pi, _ := peer.AddrInfoFromP2pAddr(addr)
-	//	h2.Connect(ctx, *pi)
+	//	MyHost.Connect(ctx, *pi)
 	//}
 
-	listener, _ := gostream.Listen(h2, p2phttp.DefaultP2PProtocol)
+	listener, _ := gostream.Listen(MyHost, p2phttp.DefaultP2PProtocol)
 	defer listener.Close()
 	go func() {
 		http.HandleFunc("/message/new", controllers.NewMessage)
@@ -123,10 +161,10 @@ func run() {
 	}()
 
 	tr := &http.Transport{}
-	tr.RegisterProtocol("libp2p", p2phttp.NewTransport(h2))
+	tr.RegisterProtocol("libp2p", p2phttp.NewTransport(MyHost))
 	//client := &http.Client{Transport: tr}
 
-	ps, err := pubsub.NewGossipSub(ctx, h2)
+	ps, err := pubsub.NewGossipSub(ctx, MyHost)
 	if err != nil {
 		panic(err)
 	}
@@ -143,32 +181,14 @@ func run() {
 
 	go func() {
 		for {
-			dhtMes, err := sub.Next(ctx)
-			if err != nil {
-				log.Println(err)
-				continue
-			}
-
-			msg := internal.Message{}
-			err = json.Unmarshal(dhtMes.Data, &msg)
-			if err != nil {
-				log.Println(err)
-				continue
-			}
-
-			misk.PrintBlock(
-				misk.ValueInfo("New message from", msg.From),
-				misk.ValueInfo("To", msg.To),
-				misk.ValueInfo("Date", msg.CreatedAt.Format("02.01.06 15:04")),
-				misk.ValueInfo("Text", msg.Text),
-			)
+			ProcessDhtMessage(sub)
 		}
 	}()
 
 	misk.PrintBlock(
 		misk.ValueInfo("Welcome to", "libp2p-chat"),
 		misk.ValueInfo("Coded by", "Vladislav Sharoshkin"),
-		misk.ValueInfo("You ID", h2.ID()),
+		misk.ValueInfo("You ID", MyHost.ID()),
 	)
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -178,21 +198,20 @@ func run() {
 		switch command[0] {
 		case "info":
 			misk.PrintBlock(
-				misk.ValueInfo("ID", h2.ID()),
-				misk.ValueInfo("Peers", len(h2.Peerstore().Peers())),
+				misk.ValueInfo("ID", MyHost.ID()),
+				misk.ValueInfo("Peers", len(MyHost.Peerstore().Peers())),
 			)
 		case "clear":
 			misk.ClearConsole()
 		case "send":
-			add, _ := peer.Decode(command[1])
+			add, err := peer.Decode(command[1])
+			if err != nil {
+				log.Println(err)
+			}
 			text := command[2]
 
-			mes, _ := internal.MessageSend(topic, h2.ID(), add, text)
+			internal.MessageSend(topic, MyHost.ID(), add, text, MyHost.Peerstore().PrivKey(MyHost.ID()))
 
-			misk.PrintBlock(
-				misk.ValueInfo("Send message", mes.Text),
-				misk.ValueInfo("To", mes.To),
-			)
 		case "put":
 			err := topic.Publish(ctx, []byte(command[1]))
 			if err != nil {
